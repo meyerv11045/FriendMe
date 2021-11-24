@@ -1,14 +1,19 @@
-import numpy as np
-from numpy.lib.shape_base import column_stack
-import scipy
-from scipy.sparse import csr_matrix
-from lightfm import LightFM
-import pickle
+from google.cloud import tasks_v2
+from google.protobuf import timestamp_pb2
+import datetime
+import json
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
-import json
+import random
+import numpy as np
+from lightfm import LightFM
+import pickle
+import scipy
+from scipy.sparse import csr_matrix
 
+# import os
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"]="C:/Users/noskc/Desktop/FriendMe Cloud Owner Credential.json"
 
 def setup_database_conn():
         credentials_key = \
@@ -26,8 +31,86 @@ def setup_database_conn():
         creds = json.loads(credentials_key)
         cred = credentials.Certificate(creds)
         firebase_admin.initialize_app(cred)
+
 setup_database_conn()
 
+class MessageScheduler():
+    def __init__(self):
+        
+        # Create a client.
+        self.client = tasks_v2.CloudTasksClient()
+
+        self.project = 'friendme-8b0c3'
+        self.queue = 'message-send-queue'
+        self.location = 'us-central1'
+        self.url = 'https://us-central1-friendme-8b0c3.cloudfunctions.net/send-text-unauthenticated'
+        
+        #audience = 'https://us-central1-friendme-8b0c3.cloudfunctions.net/send-text'
+        #service_account_email = 'jackson-s-computer@friendme-8b0c3.iam.gserviceaccount.com'
+        
+        # Construct the fully qualified queue name.
+        self.parent = self.client.queue_path(self.project, self.location, self.queue)
+        
+    def send_message_payload(self, task_name, phone_number, quote_id, send_time_seconds):
+        assert isinstance(phone_number, str)
+        assert isinstance(quote_id, int)
+        
+        payload = {'PhoneNumber': phone_number, 'QuoteId': quote_id}
+        
+        # Construct the request body.
+        task = {
+            "http_request": {  # Specify the type of request.
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": self.url,  # The full url path that the task will be sent to.
+                #"oidc_token": {"service_account_email": service_account_email, "audience": audience},
+            }
+        }
+        
+        # Convert dict to JSON string
+        payload = json.dumps(payload)
+        # specify http content-type to application/json
+        task["http_request"]["headers"] = {"Content-type": "application/json"}
+        # The API expects a payload of type bytes.
+        converted_payload = payload.encode()
+        # Add the payload to the request.
+        task["http_request"]["body"] = converted_payload
+
+
+        # Convert "seconds from now" into an rfc3339 datetime string.
+        d = datetime.datetime.utcnow() + datetime.timedelta(seconds=send_time_seconds)
+        # Create Timestamp protobuf.
+        timestamp = timestamp_pb2.Timestamp()
+        timestamp.FromDatetime(d)
+        # Add the timestamp to the tasks.
+        task["schedule_time"] = timestamp
+
+        # Add name to the task
+        task["name"] = self.client.task_path(self.project, self.location, self.queue, task_name)
+
+        # Use the client to build and send the task.
+        response = self.client.create_task(request={"parent": self.parent, "task": task})
+
+    #both are strings
+    def schedule_message(self, task_name, phone_number, quote_id, send_time_seconds):
+        assert isinstance(phone_number, str)
+        assert isinstance(quote_id, int)
+        
+        self.send_message_payload(task_name, phone_number, quote_id, send_time_seconds)
+        
+        # set a very low sentiment to prevent double recommendation before a text is sent
+        default_sentiment = 0.001
+        db = firestore.client()
+        quote_dictionary = db.collection(u'Quotes').document(str(quote_id)).get().to_dict()
+        quote_dictionary['TotalSentiment'] += default_sentiment
+        db.collection(u'Quotes').document(str(quote_id)).set(quote_dictionary)
+        
+        
+        # set the initial recommender score to prevent double recommednation (in case there is never a response)
+        user_dict = db.collection(u'BasicUserData').document(phone_number).get().to_dict()
+        recommender_dictionary = db.collection(u'RecommenderScores').document(str(user_dict['UserId'])).get().to_dict()
+        recommender_dictionary[str(quote_id)] = default_sentiment
+        db.collection(u'RecommenderScores').document(str(user_dict['UserId'])).set(recommender_dictionary)
+                      
 class Recommender():
     def __init__(self, *args):
         if len(args) == 1:
@@ -91,7 +174,7 @@ class Recommender():
         
         if len(user_items_test) == 0:
             return None
-
+        
         recommendations = np.array(self.model.predict(user_id, user_items_test))
         recommendations = np.column_stack((user_items_test,recommendations))
         
@@ -123,54 +206,32 @@ class Recommender():
             
         self.matrix = lil_matrix.tocsr()
 
-
-# num_users = 5
-# num_items = 5
-
-# recommender = Recommender(num_users, num_items)
-
-# recommender.edit_matrix(
-#     [0,1,4,0,3,1,1,2,4,3,4,3,2,2,2,2,3,0,4],
-#     [0,1,2,2,4,0,1,2,3,4,0,1,2,3,4,1,4,4,3],
-#     [5,1,1,10,0.5,1,-1,1,1,1,1,-12,1,1,-1,-0.5,1,-1,-1])
-
-
-# recommender.fit(1000)
-
-# recommender.print_matrix()
-
-# recommendations = recommender.recommend(1, 1)
-
-
-
-# recommender2 = Recommender(5, 10)
-
-# recommender2.edit_matrix(
-#     [0,0,2,2,2,2,3,3,3,3,3,4,4,4,4,4,1,1],
-#     [0,1,0,1,2,3,2,3,4,5,6,4,5,6,7,8,7,8],
-#     [1,-1,1,-1,1,1,1,1,1,-1,-1,1,-1,-1,1,-1,1,-1])
-
-
-# recommender2.fit(1000)
-
-# recommender2.print_matrix()
-
-# recommendations = recommender2.recommend(1, 10)
-
-# print(recommendations)
-
-# recommender2.save('saved')
-
-# recommender3 = Recommender('saved')
-# recommender3.print_matrix()
-# recommendations = recommender3.recommend(1, 10)
-# print(recommendations)
-
-recommender4 = Recommender()
-
-recommender4.save('poop')
-
-recommender5 = Recommender('poop')
-recommender5.edit_matrix([0], [10], [1000])
-recommender4.print_matrix()
-recommender5.print_matrix()
+def callback(request):
+    db = firestore.client()
+    
+    recommender = Recommender()
+    recommender.fit(20)
+    
+    scheduler = MessageScheduler()
+    
+    # change the last quote field
+    user_data = db.collection(u'BasicUserData').get()
+    for user in user_data:
+        user_dict = user.to_dict()
+        if user_dict['IsActive']:
+            quotes = recommender.recommend(user_dict['UserId'], 1)
+        
+            if len(quotes != 0):
+                quote = quotes[0]
+            else:
+                return
+                
+            quote_index = int(quote[0])
+                
+            task_name = '2_text_user_' + str(user_dict['UserId']) + '_quote_' + str(quote_index)
+        
+            scheduler.schedule_message(task_name, user_dict['Number'], quote_index, random.randint(1, 43200))
+            
+    return 'Success'
+            
+# print(callback(None))
